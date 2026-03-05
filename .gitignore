@@ -1,5 +1,4 @@
 .pio/
 .vscode/
-include/secrets.h
-*.bin
-*.elf
+src/config.h
+src/secrets.h

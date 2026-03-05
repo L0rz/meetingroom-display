@@ -1,0 +1,52 @@
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// ══════════════════════════════════════════════════════════════════
+//  Meetingroom E-Paper Display — Konfiguration
+//  Kopiere diese Datei nach config.h und passe die Werte an.
+// ══════════════════════════════════════════════════════════════════
+
+// ── WiFi ─────────────────────────────────────────────────────────
+#define WIFI_SSID          "MeinWLAN"
+#define WIFI_PASSWORD      "MeinPasswort"
+
+// ── MQTT Broker ──────────────────────────────────────────────────
+#define MQTT_HOST          "192.168.1.100"
+#define MQTT_PORT          1883
+#define MQTT_USER          "mqtt"
+#define MQTT_PASS          "geheim"
+#define MQTT_CLIENT_ID     "meetingroom-display"
+
+// MQTT Topics (Prefix ändern für mehrere Räume)
+#define MQTT_PREFIX        "meetingroom"
+
+// ── Home Assistant ───────────────────────────────────────────────
+#define HA_HOST            "192.168.1.100"
+#define HA_PORT            8123
+#define HA_TOKEN           "dein-long-lived-access-token"
+
+// Kalender-Entity in HA
+#define HA_CALENDAR_ENTITY "calendar.meetingraum"
+
+// Input-Text Entities für nächstes Meeting
+#define HA_NEXT_TITLE      "input_text.meetingraum_next_title"
+#define HA_NEXT_START      "input_text.meetingraum_next_start"
+
+// ── Display ──────────────────────────────────────────────────────
+#define ROOM_NAME          "Meetingraum"
+#define COMPANY_NAME       "Firma GmbH"
+
+// Logo (1 = anzeigen, 0 = nur Raumname als Text)
+#define SHOW_LOGO          1
+
+// ── Timing ───────────────────────────────────────────────────────
+#define HTTP_INTERVAL_MS   (3UL * 60UL * 1000UL)     // 3 Min
+#define MIN_DRAW_MS        (3UL * 60UL * 1000UL)     // 3 Min
+#define MQTT_SETTLE_MS     (10UL * 1000UL)            // 10 Sek
+#define FULL_REFRESH_MS    (60UL * 60UL * 1000UL)     // 60 Min
+
+// ── Timezone ─────────────────────────────────────────────────────
+#define NTP_SERVER         "pool.ntp.org"
+#define TIMEZONE           "CET-1CEST,M3.5.0,M10.5.0/3"
+
+#endif // CONFIG_H

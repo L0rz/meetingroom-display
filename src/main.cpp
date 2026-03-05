@@ -1,571 +1,356 @@
 /**
- * Meetingraum-Display
- * Elecrow CrowPanel 4.2" E-Paper (SSD1683, 400x300px)
- * ESP32-S3 + Home Assistant REST API
+ * Meetingroom E-Paper Display v2
+ * Hardware: Elecrow CrowPanel 4.2" ESP32-S3, SSD1683, 400x300
+ * SPI: Bit-Banging (Hardware SPI funktioniert nicht auf CrowPanel)
  *
- * Zeigt:
- *  - FREI / BELEGT Status (groß)
- *  - Aktuelles Meeting: Titel + Uhrzeit
- *  - Nächstes Meeting: Titel + Startzeit
- *  - Raumname + aktuelle Uhrzeit/Datum
- *
- * Update-Intervall: 5 Minuten
+ * Konfiguration: config.h (WiFi, MQTT, HA, Timing, Logo)
+ * Logo: helo_logo.h (austauschbar)
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <SPI.h>
-#include <time.h>
+#include <PubSubClient.h>
+#include "EPD_SPI.h"
+#include "EPD.h"
+#include "EPD_GUI.h"
+#include "config.h"
+#if SHOW_LOGO
+#include "helo_logo.h"
+#endif
 
-// GxEPD2 Display Library
-#include <GxEPD2_BW.h>
-// Direkt den SSD1683 4.2" Treiber einbinden
-#include <epd/GxEPD2_420_GDEY042T81.h>
+typedef unsigned char UBYTE;
 
-// Fonts (Adafruit GFX)
-#include <Fonts/FreeSansBold24pt7b.h>
-#include <Fonts/FreeSansBold12pt7b.h>
-#include <Fonts/FreeSansBold9pt7b.h>
-#include <Fonts/FreeSans9pt7b.h>
+// ── Display ───────────────────────────────────────────────────────
+#define EPD_WIDTH  400
+#define EPD_HEIGHT 300
+UBYTE BlackImage[15000];  // Statischer Framebuffer (400/8 * 300)
 
-#include "secrets.h"
+// ── MQTT Topics (aus Prefix) ─────────────────────────────────────
+String topicOccupied;
+String topicCurTitle;
+String topicCurStart;
+String topicCurEnd;
+String topicNextTitle;
+String topicNextStart;
 
-// ─────────────────────────────────────────────
-// Hardware-Pins (ESP32-S3)
-// ─────────────────────────────────────────────
-#define EPD_CLK   12
-#define EPD_MOSI  11
-#define EPD_CS    45
-#define EPD_DC    46
-#define EPD_RST   47
-#define EPD_BUSY  48
-
-// ─────────────────────────────────────────────
-// Home Assistant Konfiguration
-// ─────────────────────────────────────────────
-#define HA_HOST         "http://192.168.130.3:8123"
-#define HA_TOKEN        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIzMTc2NGM5ODhkNjE0MDdmODAzMjVhNmVlMTM0ZDY4YiIsImlhdCI6MTc3MjQ2NTkwMCwiZXhwIjoyMDg3ODI1OTAwfQ.qiD_fzX867luKzvReK6quV5BYK4-rvmnw_B8SVNeEHw"
-
-#define HA_ENTITY_CAL   "/api/states/calendar.test2"
-#define HA_ENTITY_NEXT_TITLE "/api/states/input_text.meetingraum_next_title"
-#define HA_ENTITY_NEXT_START "/api/states/input_text.meetingraum_next_start"
-
-// ─────────────────────────────────────────────
-// App-Konfiguration
-// ─────────────────────────────────────────────
-#define ROOM_NAME           "Meetingraum"
-#define UPDATE_INTERVAL_MS  (5UL * 60UL * 1000UL)   // 5 Minuten
-
-// NTP
-#define NTP_SERVER      "pool.ntp.org"
-#define TZ_OFFSET_SEC   3600    // UTC+1 (Winter); für Sommer: 7200
-#define DST_OFFSET_SEC  3600    // 1h DST
-
-// ─────────────────────────────────────────────
-// Display-Setup
-// ─────────────────────────────────────────────
-// SSD1683, 400x300, 4.2"
-// Klasse: GxEPD2_420_GDEY042T81
-// Falls dein Display einen anderen Controller hat, hier anpassen.
-// Weitere Klassen: GxEPD2_420, GxEPD2_420_GYE042A87, etc.
-SPIClass epd_spi(HSPI);
-
-GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> display(
-    GxEPD2_420_GDEY042T81(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)
-);
-
-// ─────────────────────────────────────────────
-// Datenstrturen
-// ─────────────────────────────────────────────
-struct MeetingInfo {
-    bool    active    = false;
-    String  title     = "";
-    String  startTime = "";
-    String  endTime   = "";
+// ── State ─────────────────────────────────────────────────────────
+struct RoomState {
+  bool   occupied  = false;
+  String curTitle  = "";
+  String curStart  = "";
+  String curEnd    = "";
+  String nextTitle = "";
+  String nextStart = "";
+  bool   dirty     = false;
+  unsigned long dirtyAt = 0;
 };
 
-struct NextMeetingInfo {
-    String  title     = "";
-    String  startTime = "";
-    bool    valid     = false;
-};
+RoomState room;
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
 
-// ─────────────────────────────────────────────
-// Hilfsfunktionen
-// ─────────────────────────────────────────────
+unsigned long lastHttpFetch   = 0;
+unsigned long lastDraw        = 0;
+unsigned long lastFullRefresh = 0;
 
-/**
- * Extrahiert "HH:MM" aus ISO-8601 String
- * z.B. "2024-01-15T14:30:00+01:00" → "14:30"
- */
-String extractTime(const String& iso) {
-    // Format: YYYY-MM-DDTHH:MM:SS...
-    int tIdx = iso.indexOf('T');
-    if (tIdx < 0) return iso.substring(0, 5);  // Fallback
-    String timePart = iso.substring(tIdx + 1);
-    return timePart.substring(0, 5);  // HH:MM
+// ── Helpers ───────────────────────────────────────────────────────
+String extractTime(const String& dt) {
+  int tPos = dt.indexOf('T');
+  if (tPos >= 0 && dt.length() >= (unsigned)(tPos + 6))
+    return dt.substring(tPos + 1, tPos + 6);
+  int sPos = dt.indexOf(' ');
+  if (sPos >= 0 && dt.length() >= (unsigned)(sPos + 6))
+    return dt.substring(sPos + 1, sPos + 6);
+  return dt.length() >= 5 ? dt.substring(0, 5) : dt;
 }
 
-/**
- * Extrahiert "TT.MM.JJJJ" aus ISO-8601 String
- */
-String extractDate(const String& iso) {
-    if (iso.length() < 10) return iso;
-    // YYYY-MM-DD → TT.MM.JJJJ
-    String year  = iso.substring(0, 4);
-    String month = iso.substring(5, 7);
-    String day   = iso.substring(8, 10);
-    return day + "." + month + "." + year;
+String extractDate(const String& dt) {
+  if (dt.length() >= 10)
+    return dt.substring(8, 10) + "." + dt.substring(5, 7);
+  return dt;
 }
 
-/**
- * Gibt den aktuellen Wochentag auf Deutsch zurück
- */
-String weekdayDE(int wday) {
-    const char* days[] = {"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"};
-    return String(days[wday % 7]);
+// ── WiFi ──────────────────────────────────────────────────────────
+void connectWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("WiFi...");
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 40) {
+    delay(500); Serial.print("."); tries++;
+  }
+  Serial.println(WiFi.status() == WL_CONNECTED
+    ? " OK: " + WiFi.localIP().toString() : " FAIL");
 }
 
-/**
- * Gibt aktuelles Datum/Zeit als String zurück
- */
-String getCurrentDateTime() {
-    struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) {
-        return "--:-- --.--.----";
-    }
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%s %02d.%02d.%04d  %02d:%02d",
-        weekdayDE(timeinfo.tm_wday).c_str(),
-        timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
-        timeinfo.tm_hour, timeinfo.tm_min
-    );
-    return String(buf);
+// ── HTTP ──────────────────────────────────────────────────────────
+String haGet(const String& path) {
+  if (WiFi.status() != WL_CONNECTED) return "";
+  HTTPClient http;
+  http.begin("http://" + String(HA_HOST) + ":" + String(HA_PORT) + path);
+  http.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
+  int code = http.GET();
+  String body = (code == 200) ? http.getString() : "";
+  http.end();
+  return body;
 }
 
-// ─────────────────────────────────────────────
-// HTTP-Hilfsfunktion
-// ─────────────────────────────────────────────
-String httpGetHA(const String& path) {
-    HTTPClient http;
-    String url = String(HA_HOST) + path;
-    http.begin(url);
-    http.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(10000);
+void fetchFromHA() {
+  Serial.println("Fetching HA...");
+  bool changed = false;
 
-    int code = http.GET();
-    String payload = "";
-    if (code == 200) {
-        payload = http.getString();
-    } else {
-        Serial.printf("[HTTP] Fehler %d bei %s\n", code, path.c_str());
-    }
-    http.end();
-    return payload;
-}
-
-// ─────────────────────────────────────────────
-// HA-Daten abrufen
-// ─────────────────────────────────────────────
-MeetingInfo fetchCurrentMeeting() {
-    MeetingInfo info;
-    String json = httpGetHA(HA_ENTITY_CAL);
-    if (json.isEmpty()) return info;
-
+  String body = haGet("/api/states/" + String(HA_CALENDAR_ENTITY));
+  if (body.length() > 0) {
     JsonDocument doc;
-    if (deserializeJson(doc, json) != DeserializationError::Ok) {
-        Serial.println("[JSON] Parse-Fehler (calendar)");
-        return info;
+    if (deserializeJson(doc, body) == DeserializationError::Ok) {
+      JsonObject attrs = doc["attributes"].as<JsonObject>();
+      bool   no = (doc["state"].as<String>() == "on");
+      String nt = attrs["message"].as<String>();
+      String ns = attrs["start_time"].as<String>();
+      String ne = attrs["end_time"].as<String>();
+      if (no != room.occupied || nt != room.curTitle ||
+          ns != room.curStart  || ne != room.curEnd) {
+        room.occupied = no; room.curTitle = nt;
+        room.curStart = ns; room.curEnd   = ne;
+        changed = true;
+      }
     }
+  }
 
-    const char* state = doc["state"];
-    info.active = (state && strcmp(state, "on") == 0);
-
-    if (info.active) {
-        auto attrs = doc["attributes"];
-        info.title     = attrs["message"]    | "";
-        info.startTime = attrs["start_time"] | "";
-        info.endTime   = attrs["end_time"]   | "";
+  body = haGet("/api/states/" + String(HA_NEXT_TITLE));
+  if (body.length() > 0) {
+    JsonDocument doc;
+    if (deserializeJson(doc, body) == DeserializationError::Ok) {
+      String v = doc["state"].as<String>();
+      if (v != room.nextTitle) { room.nextTitle = v; changed = true; }
     }
+  }
 
-    return info;
+  body = haGet("/api/states/" + String(HA_NEXT_START));
+  if (body.length() > 0) {
+    JsonDocument doc;
+    if (deserializeJson(doc, body) == DeserializationError::Ok) {
+      String v = doc["state"].as<String>();
+      if (v != room.nextStart) { room.nextStart = v; changed = true; }
+    }
+  }
+
+  if (changed) {
+    Serial.println("HA data changed");
+    room.dirtyAt = millis();
+  }
 }
 
-NextMeetingInfo fetchNextMeeting() {
-    NextMeetingInfo next;
+// ── MQTT ──────────────────────────────────────────────────────────
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  String t = String(topic);
+  String v = String((char*)payload).substring(0, len);
+  Serial.println("MQTT: " + t + " = " + v);
 
-    // Titel
-    String jsonTitle = httpGetHA(HA_ENTITY_NEXT_TITLE);
-    if (!jsonTitle.isEmpty()) {
-        JsonDocument doc;
-        if (deserializeJson(doc, jsonTitle) == DeserializationError::Ok) {
-            const char* s = doc["state"];
-            if (s && strlen(s) > 0 && strcmp(s, "unknown") != 0) {
-                next.title = String(s);
-                next.valid = true;
-            }
-        }
-    }
-
-    // Startzeit
-    String jsonStart = httpGetHA(HA_ENTITY_NEXT_START);
-    if (!jsonStart.isEmpty()) {
-        JsonDocument doc;
-        if (deserializeJson(doc, jsonStart) == DeserializationError::Ok) {
-            const char* s = doc["state"];
-            if (s && strlen(s) > 0 && strcmp(s, "unknown") != 0) {
-                next.startTime = String(s);
-            }
-        }
-    }
-
-    return next;
+  bool newOcc = (v == "true");
+  if      (t == topicOccupied  && newOcc != room.occupied)  { room.occupied  = newOcc; room.dirtyAt = millis(); }
+  else if (t == topicCurTitle  && v != room.curTitle)       { room.curTitle  = v;      room.dirtyAt = millis(); }
+  else if (t == topicCurStart  && v != room.curStart)       { room.curStart  = v;      room.dirtyAt = millis(); }
+  else if (t == topicCurEnd    && v != room.curEnd)         { room.curEnd    = v;      room.dirtyAt = millis(); }
+  else if (t == topicNextTitle && v != room.nextTitle)      { room.nextTitle = v;      room.dirtyAt = millis(); }
+  else if (t == topicNextStart && v != room.nextStart)      { room.nextStart = v;      room.dirtyAt = millis(); }
 }
 
-// ─────────────────────────────────────────────
-// Display-Rendering
-// ─────────────────────────────────────────────
-
-/**
- * Text zentriert ausgeben (x = Mittelpunkt)
- */
-void drawCenteredText(const String& text, int cx, int y) {
-    int16_t  x1, y1;
-    uint16_t w, h;
-    display.getTextBounds(text.c_str(), 0, 0, &x1, &y1, &w, &h);
-    display.setCursor(cx - w / 2, y);
-    display.print(text);
+void connectMqtt() {
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(512);
+  Serial.print("MQTT...");
+  if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+    Serial.println(" OK");
+    mqtt.subscribe(topicOccupied.c_str());
+    mqtt.subscribe(topicCurTitle.c_str());
+    mqtt.subscribe(topicCurStart.c_str());
+    mqtt.subscribe(topicCurEnd.c_str());
+    mqtt.subscribe(topicNextTitle.c_str());
+    mqtt.subscribe(topicNextStart.c_str());
+  } else {
+    Serial.println(" FAIL: " + String(mqtt.state()));
+  }
 }
 
-/**
- * Langer Text auf mehrere Zeilen umbrechen (max. lineWidth Pixel breit)
- * Gibt neue Y-Position zurück
- */
-int drawWrappedText(const String& text, int x, int y, int lineWidth) {
-    String word, line;
-    int16_t  bx, by;
-    uint16_t bw, bh;
-    int lineHeight = 20;  // Schätzwert, wird unten korrigiert
+// ── Draw ──────────────────────────────────────────────────────────
+void drawDisplay() {
+  Serial.println("Drawing...");
+  EPD_Init_Fast(Fast_Seconds_1_5s);
+  Paint_NewImage(BlackImage, EPD_WIDTH, EPD_HEIGHT, ROTATE_0, WHITE);
+  EPD_Full(WHITE);
 
-    // Zeilenhöhe ermitteln
-    display.getTextBounds("Ag", 0, 0, &bx, &by, &bw, &bh);
-    lineHeight = bh + 4;
+  // ── Header ────────────────────────────────────────────────────
+  EPD_DrawRectangle(0, 0, 399, 49, BLACK, 1);
 
-    String remaining = text;
-    remaining.trim();
+#if SHOW_LOGO
+  EPD_ShowPicture(8, 7, LOGO_W, LOGO_H, helo_logo, WHITE);
+#else
+  EPD_ShowString(10, 12, ROOM_NAME, 24, WHITE);
+#endif
 
-    while (remaining.length() > 0) {
-        int spaceIdx = remaining.indexOf(' ');
-        if (spaceIdx < 0) {
-            word = remaining;
-            remaining = "";
-        } else {
-            word = remaining.substring(0, spaceIdx);
-            remaining = remaining.substring(spaceIdx + 1);
-        }
+  struct tm ti;
+  if (getLocalTime(&ti)) {
+    char tbuf[10], dbuf[12];
+    strftime(tbuf, sizeof(tbuf), "%H:%M", &ti);
+    strftime(dbuf, sizeof(dbuf), "%d.%m.%Y", &ti);
+    EPD_ShowString(310, 6,  tbuf, 24, WHITE);
+    EPD_ShowString(298, 32, dbuf, 12, WHITE);
+  }
 
-        String testLine = line.isEmpty() ? word : line + " " + word;
-        display.getTextBounds(testLine.c_str(), x, 0, &bx, &by, &bw, &bh);
+  // ── Status ────────────────────────────────────────────────────
+  int y = 58;
+  if (room.occupied) {
+    EPD_DrawRectangle(0, y, 399, y + 44, BLACK, 1);
+    EPD_ShowString(140, y + 10, "BELEGT", 24, WHITE);
+    y += 52;
 
-        if (bw > (uint16_t)lineWidth && !line.isEmpty()) {
-            display.setCursor(x, y);
-            display.print(line);
-            y += lineHeight;
-            line = word;
-        } else {
-            line = testLine;
-        }
+    String title = room.curTitle;
+    if (title.length() > 34) title = title.substring(0, 31) + "...";
+    EPD_ShowString(12, y, title.c_str(), 24, BLACK);
+    y += 28;
+
+    if (room.curStart.length() > 0) {
+      String zeitraum = extractTime(room.curStart) + " - " + extractTime(room.curEnd) + " Uhr";
+      EPD_ShowString(12, y, zeitraum.c_str(), 16, BLACK);
+      y += 24;
     }
+  } else {
+    EPD_DrawRectangle(4, y, 395, y + 60, BLACK, 0);
+    EPD_DrawRectangle(6, y+2, 393, y+58, BLACK, 0);
+    EPD_ShowString(155, y + 16, "FREI", 24, BLACK);
+    y += 70;
+  }
 
-    if (!line.isEmpty()) {
-        display.setCursor(x, y);
-        display.print(line);
-        y += lineHeight;
+  // ── Trennlinie ────────────────────────────────────────────────
+  y += 4;
+  EPD_DrawLine(10, y, 389, y, BLACK);
+  EPD_DrawLine(10, y+1, 389, y+1, BLACK);
+  y += 12;
+
+  // ── Nächstes Meeting ──────────────────────────────────────────
+  EPD_ShowString(12, y, "Naechstes Meeting", 16, BLACK);
+  EPD_DrawLine(12, y + 18, 180, y + 18, BLACK);
+  y += 26;
+
+  if (room.nextTitle.length() > 0 &&
+      room.nextTitle != "-" &&
+      room.nextTitle != "Keine Termine") {
+    String nt = room.nextTitle;
+    if (nt.length() > 34) nt = nt.substring(0, 31) + "...";
+    EPD_ShowString(12, y, nt.c_str(), 16, BLACK);
+    y += 22;
+    if (room.nextStart.length() >= 16) {
+      String info = extractTime(room.nextStart) + " Uhr  |  " + extractDate(room.nextStart);
+      EPD_ShowString(12, y, info.c_str(), 16, BLACK);
     }
+  } else {
+    EPD_ShowString(12, y, "Keine weiteren Termine", 16, BLACK);
+  }
 
-    return y;
+  // ── Footer ────────────────────────────────────────────────────
+  EPD_DrawLine(0, 284, 399, 284, BLACK);
+  struct tm tf;
+  if (getLocalTime(&tf)) {
+    char sbuf[30];
+    strftime(sbuf, sizeof(sbuf), "Aktualisiert: %H:%M", &tf);
+    EPD_ShowString(8, 287, sbuf, 12, BLACK);
+  }
+  EPD_ShowString(300, 287, COMPANY_NAME, 12, BLACK);
+
+  // ── Refresh ───────────────────────────────────────────────────
+  EPD_Display_Fast(BlackImage);
+  EPD_Sleep();
+
+  room.dirty   = false;
+  room.dirtyAt = 0;
+  lastDraw        = millis();
+  lastFullRefresh = millis();
+  Serial.println("Draw done.");
 }
 
-/**
- * Hauptrendering – wird im GxEPD2-Page-Loop aufgerufen
- */
-void renderDisplay(const MeetingInfo& meeting, const NextMeetingInfo& next) {
-    display.fillScreen(GxEPD_WHITE);
-
-    // ── Header ──────────────────────────────────────────────────────
-    // Hintergrundsbalken
-    display.fillRect(0, 0, 400, 38, GxEPD_BLACK);
-    display.setTextColor(GxEPD_WHITE);
-
-    // Raumname links
-    display.setFont(&FreeSansBold9pt7b);
-    display.setCursor(8, 26);
-    display.print(ROOM_NAME);
-
-    // Datum + Uhrzeit rechts
-    String datetime = getCurrentDateTime();
-    display.setFont(&FreeSans9pt7b);
-    int16_t bx, by; uint16_t bw, bh;
-    display.getTextBounds(datetime.c_str(), 0, 0, &bx, &by, &bw, &bh);
-    display.setCursor(400 - bw - 8, 26);
-    display.print(datetime);
-
-    // ── Trennlinie ───────────────────────────────────────────────────
-    display.drawLine(0, 39, 400, 39, GxEPD_BLACK);
-
-    // ── Status-Banner ────────────────────────────────────────────────
-    if (meeting.active) {
-        // BELEGT – schwarzer Block
-        display.fillRect(0, 45, 400, 120, GxEPD_BLACK);
-        display.setTextColor(GxEPD_WHITE);
-        display.setFont(&FreeSansBold24pt7b);
-        drawCenteredText("BELEGT", 200, 115);
-    } else {
-        // FREI – weißer Block mit Rahmen
-        display.drawRect(10, 50, 380, 108, GxEPD_BLACK);
-        display.drawRect(12, 52, 376, 104, GxEPD_BLACK);
-        display.setTextColor(GxEPD_BLACK);
-        display.setFont(&FreeSansBold24pt7b);
-        drawCenteredText("FREI", 200, 120);
-    }
-
-    display.setTextColor(GxEPD_BLACK);
-
-    // ── Aktuelles Meeting ────────────────────────────────────────────
-    if (meeting.active) {
-        display.drawLine(0, 172, 400, 172, GxEPD_BLACK);
-
-        // Titel
-        display.setFont(&FreeSansBold12pt7b);
-        display.setCursor(10, 197);
-        // Titel kürzen wenn zu lang
-        String title = meeting.title;
-        display.getTextBounds(title.c_str(), 0, 0, &bx, &by, &bw, &bh);
-        while (bw > 380 && title.length() > 3) {
-            title = title.substring(0, title.length() - 4) + "...";
-            display.getTextBounds(title.c_str(), 0, 0, &bx, &by, &bw, &bh);
-        }
-        display.print(title);
-
-        // Zeitraum
-        if (meeting.startTime.length() > 0) {
-            String timeRange = extractTime(meeting.startTime) + " – " + extractTime(meeting.endTime);
-            display.setFont(&FreeSans9pt7b);
-            display.setCursor(10, 220);
-            display.print(timeRange);
-        }
-    }
-
-    // ── Nächstes Meeting ─────────────────────────────────────────────
-    int divY = meeting.active ? 235 : 180;
-    display.drawLine(0, divY, 400, divY, GxEPD_BLACK);
-
-    display.setFont(&FreeSans9pt7b);
-    display.setCursor(10, divY + 20);
-    display.print("Naechstes Meeting:");
-
-    if (next.valid && next.title.length() > 0) {
-        display.setFont(&FreeSansBold9pt7b);
-        String nextTitle = next.title;
-        display.getTextBounds(nextTitle.c_str(), 0, 0, &bx, &by, &bw, &bh);
-        while (bw > 380 && nextTitle.length() > 3) {
-            nextTitle = nextTitle.substring(0, nextTitle.length() - 4) + "...";
-            display.getTextBounds(nextTitle.c_str(), 0, 0, &bx, &by, &bw, &bh);
-        }
-        display.setCursor(10, divY + 42);
-        display.print(nextTitle);
-
-        if (next.startTime.length() > 0) {
-            display.setFont(&FreeSans9pt7b);
-            display.setCursor(10, divY + 62);
-            // Start kann ISO oder HH:MM sein
-            String startStr = next.startTime;
-            if (startStr.indexOf('T') >= 0) {
-                startStr = extractTime(startStr) + " Uhr";
-            }
-            display.print("Start: " + startStr);
-        }
-    } else {
-        display.setFont(&FreeSans9pt7b);
-        display.setCursor(10, divY + 42);
-        display.print("Kein weiteres Meeting geplant");
-    }
-
-    // ── Footer ───────────────────────────────────────────────────────
-    // Kleiner Hinweis unten rechts (Update-Indikator)
-    display.setFont(nullptr);  // Default 5x7 Font
-    display.setTextSize(1);
-    display.setCursor(320, 292);
-    display.print("Update: 5min");
-}
-
-// ─────────────────────────────────────────────
-// Display aktualisieren
-// ─────────────────────────────────────────────
-void updateDisplay(const MeetingInfo& meeting, const NextMeetingInfo& next) {
-    Serial.println("[Display] Starte Update...");
-
-    display.setFullWindow();
-    display.firstPage();
-    do {
-        renderDisplay(meeting, next);
-    } while (display.nextPage());
-
-    Serial.println("[Display] Update abgeschlossen.");
-}
-
-// ─────────────────────────────────────────────
-// WiFi verbinden
-// ─────────────────────────────────────────────
-bool connectWiFi() {
-    Serial.printf("[WiFi] Verbinde mit '%s'...\n", WIFI_SSID);
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-        delay(500);
-        Serial.print(".");
-        attempts++;
-    }
-    Serial.println();
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WiFi] Verbunden! IP: %s\n", WiFi.localIP().toString().c_str());
-        return true;
-    } else {
-        Serial.println("[WiFi] Verbindung fehlgeschlagen!");
-        return false;
-    }
-}
-
-// ─────────────────────────────────────────────
-// Setup
-// ─────────────────────────────────────────────
+// ── Setup ─────────────────────────────────────────────────────────
 void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("\n=== Meetingraum-Display ===");
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== Meetingroom Display v2 ===");
 
-    // SPI mit custom Pins initialisieren
-    epd_spi.begin(EPD_CLK, -1, EPD_MOSI, EPD_CS);
+  // MQTT Topics aus Prefix bauen
+  String prefix = String(MQTT_PREFIX);
+  topicOccupied  = prefix + "/occupied";
+  topicCurTitle  = prefix + "/current/title";
+  topicCurStart  = prefix + "/current/start";
+  topicCurEnd    = prefix + "/current/end";
+  topicNextTitle = prefix + "/next/title";
+  topicNextStart = prefix + "/next/start";
 
-    // Display initialisieren
-    display.epd2.selectSPI(epd_spi, SPISettings(4000000, MSBFIRST, SPI_MODE0));
-    display.init(115200, true, 2, false);
-    display.setRotation(0);   // 0 = Portrait 400x300; ggf. 1 für Landscape
+  // Display Power
+  pinMode(7, OUTPUT);
+  digitalWrite(7, HIGH);
 
-    Serial.println("[Display] Initialisiert.");
+  // EPD Init + Splash
+  EPD_GPIOInit();
+  EPD_Clear();
+  Paint_NewImage(BlackImage, EPD_WIDTH, EPD_HEIGHT, ROTATE_0, WHITE);
+  EPD_Full(WHITE);
+  EPD_ShowString(20, 130, "Verbinde mit WiFi...", 24, BLACK);
+  EPD_Display_Part(0, 0, EPD_WIDTH, EPD_HEIGHT, BlackImage);
+  EPD_Sleep();
 
-    // Startbild anzeigen (Ladebildschirm)
-    display.setFullWindow();
-    display.firstPage();
-    do {
-        display.fillScreen(GxEPD_WHITE);
-        display.setTextColor(GxEPD_BLACK);
-        display.setFont(&FreeSansBold12pt7b);
-        display.setCursor(10, 50);
-        display.print(ROOM_NAME);
-        display.setFont(&FreeSans9pt7b);
-        display.setCursor(10, 80);
-        display.print("Verbinde mit WiFi...");
-    } while (display.nextPage());
+  // WiFi + NTP
+  connectWifi();
+  configTime(0, 0, NTP_SERVER);
+  setenv("TZ", TIMEZONE, 1);
+  tzset();
+  delay(1500);
 
-    // WiFi verbinden
-    if (!connectWiFi()) {
-        // Fehler anzeigen
-        display.setFullWindow();
-        display.firstPage();
-        do {
-            display.fillScreen(GxEPD_WHITE);
-            display.setTextColor(GxEPD_BLACK);
-            display.setFont(&FreeSansBold12pt7b);
-            display.setCursor(10, 80);
-            display.print("WiFi Fehler!");
-            display.setFont(&FreeSans9pt7b);
-            display.setCursor(10, 110);
-            display.print("Bitte Zugangsdaten in");
-            display.setCursor(10, 130);
-            display.print("secrets.h pruefen.");
-        } while (display.nextPage());
-        // Trotzdem weitermachen, Display zeigt Fehler
-        return;
-    }
+  // Daten + MQTT
+  fetchFromHA();
+  connectMqtt();
 
-    // NTP Zeitsync
-    Serial.println("[NTP] Synchronisiere Zeit...");
-    configTime(TZ_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER, "time.google.com");
+  // Warten auf MQTT retained Messages
+  unsigned long t = millis();
+  while (millis() - t < 3000) {
+    mqtt.loop();
+    delay(50);
+  }
 
-    // Auf Zeitsync warten (max. 10s)
-    struct tm timeinfo;
-    int ntpAttempts = 0;
-    while (!getLocalTime(&timeinfo) && ntpAttempts < 20) {
-        delay(500);
-        ntpAttempts++;
-    }
-
-    if (ntpAttempts < 20) {
-        char timeBuf[32];
-        strftime(timeBuf, sizeof(timeBuf), "%d.%m.%Y %H:%M:%S", &timeinfo);
-        Serial.printf("[NTP] Zeit: %s\n", timeBuf);
-    } else {
-        Serial.println("[NTP] Zeitsync fehlgeschlagen – weiter ohne Zeit.");
-    }
-
-    // Ersten Datenabruf und Display-Update
-    MeetingInfo    meeting = fetchCurrentMeeting();
-    NextMeetingInfo next   = fetchNextMeeting();
-
-    Serial.printf("[Status] Meeting aktiv: %s\n", meeting.active ? "JA" : "NEIN");
-    if (meeting.active) {
-        Serial.printf("[Status] Titel: %s, %s – %s\n",
-            meeting.title.c_str(),
-            meeting.startTime.c_str(),
-            meeting.endTime.c_str());
-    }
-
-    updateDisplay(meeting, next);
+  drawDisplay();
+  Serial.println("Setup done.");
 }
 
-// ─────────────────────────────────────────────
-// Loop
-// ─────────────────────────────────────────────
+// ── Loop ──────────────────────────────────────────────────────────
 void loop() {
-    static unsigned long lastUpdate = 0;
+  if (WiFi.status() != WL_CONNECTED) connectWifi();
+  if (!mqtt.connected()) connectMqtt();
+  mqtt.loop();
 
-    // WiFi-Reconnect falls nötig
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WiFi] Verbindung unterbrochen – reconnecte...");
-        WiFi.reconnect();
-        unsigned long t = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
-            delay(500);
-        }
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("[WiFi] Reconnect fehlgeschlagen.");
-            delay(30000);
-            return;
-        }
-        Serial.println("[WiFi] Reconnect erfolgreich.");
-    }
+  unsigned long now = millis();
 
-    unsigned long now = millis();
-    if (lastUpdate == 0 || (now - lastUpdate) >= UPDATE_INTERVAL_MS) {
-        lastUpdate = now;
+  // Settling
+  if (room.dirtyAt > 0 && (now - room.dirtyAt > MQTT_SETTLE_MS)) {
+    room.dirty   = true;
+    room.dirtyAt = 0;
+  }
 
-        Serial.println("[Loop] Daten werden aktualisiert...");
+  // HTTP Polling
+  if (now - lastHttpFetch > HTTP_INTERVAL_MS) {
+    fetchFromHA();
+    lastHttpFetch = now;
+  }
 
-        MeetingInfo    meeting = fetchCurrentMeeting();
-        NextMeetingInfo next   = fetchNextMeeting();
+  // Anti-Ghosting
+  if (now - lastFullRefresh > FULL_REFRESH_MS) {
+    room.dirty = true;
+  }
 
-        Serial.printf("[Loop] Meeting aktiv: %s\n", meeting.active ? "JA" : "NEIN");
+  // Draw
+  if (room.dirty && (now - lastDraw > MIN_DRAW_MS)) {
+    drawDisplay();
+  }
 
-        updateDisplay(meeting, next);
-    }
-
-    // Kurzes Schlafen um CPU-Last zu reduzieren
-    delay(10000);  // 10 Sekunden warten, dann wieder prüfen
+  delay(200);
 }
