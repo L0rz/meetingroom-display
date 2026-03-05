@@ -176,6 +176,24 @@ void connectMqtt() {
   }
 }
 
+
+// ── Meeting Progress ──────────────────────────────────────────────
+// Parst "2026-03-05 22:00:00" oder "2026-03-05T22:00:00+01:00" zu epoch
+time_t parseDateTime(const String& dt) {
+  struct tm tm = {};
+  // Format: YYYY-MM-DD HH:MM:SS oder YYYY-MM-DDTHH:MM:SS
+  if (dt.length() < 16) return 0;
+  tm.tm_year = dt.substring(0, 4).toInt() - 1900;
+  tm.tm_mon  = dt.substring(5, 7).toInt() - 1;
+  tm.tm_mday = dt.substring(8, 10).toInt();
+  int sep = (dt.charAt(10) == 'T') ? 11 : 11;
+  tm.tm_hour = dt.substring(11, 13).toInt();
+  tm.tm_min  = dt.substring(14, 16).toInt();
+  if (dt.length() >= 19) tm.tm_sec = dt.substring(17, 19).toInt();
+  tm.tm_isdst = -1;
+  return mktime(&tm);
+}
+
 // ── Draw ──────────────────────────────────────────────────────────
 void drawDisplay() {
   Serial.println("Drawing...");
@@ -198,14 +216,14 @@ void drawDisplay() {
     strftime(tbuf, sizeof(tbuf), "%H:%M", &ti);
     strftime(dbuf, sizeof(dbuf), "%d.%m.%Y", &ti);
     EPD_ShowString(310, 6,  tbuf, 24, WHITE);
-    EPD_ShowString(298, 32, dbuf, 12, WHITE);
+    EPD_ShowString(310, 32, dbuf, 12, WHITE);
   }
 
   // ── Status ────────────────────────────────────────────────────
   int y = 58;
   if (room.occupied) {
     EPD_DrawRectangle(0, y, 399, y + 44, BLACK, 1);
-    EPD_ShowString(140, y + 10, "BELEGT", 24, WHITE);
+    EPD_ShowString(164, y + 10, "BELEGT", 24, WHITE);
     y += 52;
 
     String title = room.curTitle;
@@ -218,18 +236,51 @@ void drawDisplay() {
       EPD_ShowString(12, y, zeitraum.c_str(), 16, BLACK);
       y += 24;
     }
+
+    // ── Fortschrittsbalken ──────────────────────────────────────
+    int barX = 12;
+    int barW = 376;  // 12 bis 388
+    int barH = 14;
+    // Rahmen
+    EPD_DrawRectangle(barX, y, barX + barW, y + barH, BLACK, 0);
+
+    // Fortschritt berechnen
+    time_t tStart = parseDateTime(room.curStart);
+    time_t tEnd   = parseDateTime(room.curEnd);
+    struct tm tnow;
+    if (getLocalTime(&tnow) && tStart > 0 && tEnd > tStart) {
+      time_t tNow = mktime(&tnow);
+      float progress = (float)(tNow - tStart) / (float)(tEnd - tStart);
+      if (progress < 0.0f) progress = 0.0f;
+      if (progress > 1.0f) progress = 1.0f;
+      int fillW = (int)(progress * (barW - 4));
+      if (fillW > 0) {
+        EPD_DrawRectangle(barX + 2, y + 2, barX + 2 + fillW, y + barH - 2, BLACK, 1);
+      }
+      // Prozent rechts neben dem Balken
+      char pctBuf[6];
+      snprintf(pctBuf, sizeof(pctBuf), "%d%%", (int)(progress * 100));
+      // Verbleibende Minuten links anzeigen
+      int remaining = (int)((tEnd - tNow) / 60);
+      if (remaining > 0) {
+        char remBuf[20];
+        snprintf(remBuf, sizeof(remBuf), "noch %d Min", remaining);
+        EPD_ShowString(barX, y + barH + 3, remBuf, 12, BLACK);
+      }
+      EPD_ShowString(barX + barW - 35, y + barH + 3, pctBuf, 12, BLACK);
+    }
+    y += barH + 18;
   } else {
     EPD_DrawRectangle(4, y, 395, y + 60, BLACK, 0);
     EPD_DrawRectangle(6, y+2, 393, y+58, BLACK, 0);
-    EPD_ShowString(155, y + 16, "FREI", 24, BLACK);
+    EPD_ShowString(176, y + 16, "FREI", 24, BLACK);
     y += 70;
   }
 
-  // ── Trennlinie ────────────────────────────────────────────────
+  // ── Trennlinie (nur bei FREI oder nach Balken) ────────────────
   y += 4;
   EPD_DrawLine(10, y, 389, y, BLACK);
-  EPD_DrawLine(10, y+1, 389, y+1, BLACK);
-  y += 12;
+  y += 10;
 
   // ── Nächstes Meeting ──────────────────────────────────────────
   EPD_ShowString(12, y, "Naechstes Meeting", 16, BLACK);
@@ -271,6 +322,11 @@ void drawDisplay() {
   lastFullRefresh = millis();
   Serial.println("Draw done.");
 }
+
+
+// ── Clock Update ─────────────────────────────────────────────────
+unsigned long lastClockUpdate = 0;
+char lastTimeStr[6] = "";
 
 // ── Setup ─────────────────────────────────────────────────────────
 void setup() {
@@ -350,6 +406,21 @@ void loop() {
   // Draw
   if (room.dirty && (now - lastDraw > MIN_DRAW_MS)) {
     drawDisplay();
+  }
+
+  // Uhrzeit jede Minute aktualisieren (Full Fast Refresh)
+  if (now - lastClockUpdate > 60000UL) {
+    struct tm tc;
+    if (getLocalTime(&tc)) {
+      char tbuf[6];
+      strftime(tbuf, sizeof(tbuf), "%H:%M", &tc);
+      if (strcmp(tbuf, lastTimeStr) != 0) {
+        strcpy(lastTimeStr, tbuf);
+        Serial.println("Clock changed: " + String(tbuf));
+        drawDisplay();
+      }
+    }
+    lastClockUpdate = now;
   }
 
   delay(200);
