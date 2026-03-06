@@ -1,9 +1,10 @@
 /**
- * Meetingroom E-Paper Display v3
+ * Meetingroom E-Paper Display v3.1
  * Hardware: Elecrow CrowPanel 4.2" ESP32-S3, SSD1683, 400x300
  * SPI: Bit-Banging (Hardware SPI funktioniert nicht auf CrowPanel)
  *
- * v3: Battery display, Deep Sleep, Spontan-Meeting via Buttons
+ * v3.1: OTA Updates (ArduinoOTA + Web Upload)
+ * v3:   Battery display, Deep Sleep, Spontan-Meeting via Buttons
  * Konfiguration: config.h (WiFi, MQTT, HA, Timing, Logo)
  * Logo: helo_logo.h (austauschbar)
  */
@@ -13,6 +14,9 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
+#include <ArduinoOTA.h>
+#include <WebServer.h>
+#include <Update.h>
 #include "EPD_SPI.h"
 #include "EPD.h"
 #include "EPD_GUI.h"
@@ -79,6 +83,7 @@ struct RoomState {
 RoomState room;
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
+WebServer    otaWeb(80);
 
 unsigned long lastHttpFetch   = 0;
 unsigned long lastDraw        = 0;
@@ -526,10 +531,14 @@ void drawDisplay() {
     EPD_ShowString(8, 287, sbuf, 12, BLACK);
   }
 
-  // Battery icon in footer
+  // Battery icon in footer (before IP)
   float batV = readBatteryVoltage();
   int batPct = batteryPercent(batV);
-  drawBatteryIcon(220, 287, batPct);
+  drawBatteryIcon(140, 287, batPct);
+
+  // IP address for OTA access
+  String ip = WiFi.localIP().toString();
+  EPD_ShowString(180, 287, ip.c_str(), 12, BLACK);
 
   EPD_ShowString(300, 287, COMPANY_NAME, 12, BLACK);
 
@@ -563,6 +572,130 @@ void enterDeepSleep() {
   esp_deep_sleep_start();
 }
 #endif
+
+// ── OTA Web Upload ───────────────────────────────────────────────
+const char OTA_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Meetingroom Display OTA</title>
+<style>
+body{font-family:sans-serif;max-width:500px;margin:40px auto;padding:0 20px;background:#1a1a2e;color:#e0e0e0}
+h1{color:#00d4ff}
+.box{background:#16213e;padding:20px;border-radius:8px;margin:20px 0}
+input[type=file]{margin:10px 0}
+button{background:#00d4ff;color:#000;border:none;padding:10px 24px;border-radius:4px;cursor:pointer;font-size:16px}
+button:hover{background:#00a8cc}
+#prog{width:100%;height:20px;margin:10px 0;display:none}
+#status{margin:10px 0;font-weight:bold}
+.info{color:#888;font-size:13px}
+</style></head><body>
+<h1>&#x1f4e1; OTA Update</h1>
+<div class="box">
+<p>Firmware (.bin) hochladen:</p>
+<form id="f" method="POST" action="/update" enctype="multipart/form-data">
+<input type="file" name="firmware" accept=".bin" required><br>
+<button type="submit">Firmware flashen</button>
+</form>
+<progress id="prog" value="0" max="100"></progress>
+<div id="status"></div>
+</div>
+<div class="box info">
+<p><strong>Hostname:</strong> meetingroom-display.local</p>
+<p><strong>Version:</strong> v3.1</p>
+<p><strong>IP:</strong> <span id="ip">-</span></p>
+</div>
+<script>
+document.getElementById('ip').textContent=location.hostname;
+document.getElementById('f').addEventListener('submit',function(e){
+  e.preventDefault();
+  var f=new FormData(this);
+  var x=new XMLHttpRequest();
+  x.open('POST','/update');
+  var p=document.getElementById('prog');
+  var s=document.getElementById('status');
+  p.style.display='block';
+  x.upload.onprogress=function(e){if(e.lengthComputable){p.value=Math.round(e.loaded/e.total*100);}};
+  x.onload=function(){s.textContent=x.status==200?'OK! Neustart...':'Fehler: '+x.responseText;
+    if(x.status==200)setTimeout(function(){location.reload()},10000);};
+  x.onerror=function(){s.textContent='Upload fehlgeschlagen';};
+  s.textContent='Uploading...';
+  x.send(f);
+});
+</script></body></html>
+)rawliteral";
+
+bool otaInProgress = false;
+
+void setupOTA() {
+  // ── ArduinoOTA (PlatformIO / espota) ──────────────────────────
+  ArduinoOTA.setHostname("meetingroom-display");
+  ArduinoOTA.setPassword(WIFI_PASSWORD);  // Use WiFi password for OTA auth
+  ArduinoOTA.onStart([]() {
+    otaInProgress = true;
+    Serial.println("OTA Start...");
+    // Show update screen
+    EPD_Init_Fast(Fast_Seconds_1_5s);
+    Paint_NewImage(BlackImage, EPD_WIDTH, EPD_HEIGHT, ROTATE_0, WHITE);
+    EPD_Full(WHITE);
+    EPD_ShowString(100, 130, "OTA Update...", 24, BLACK);
+    EPD_Display_Fast(BlackImage);
+    EPD_Sleep();
+  });
+  ArduinoOTA.onEnd([]() {
+    otaInProgress = false;
+    Serial.println("OTA Done!");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA: %u%%\r", (progress * 100) / total);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaInProgress = false;
+    Serial.printf("OTA Error[%u]\n", error);
+  });
+  ArduinoOTA.begin();
+
+  // ── Web OTA (Browser Upload) ──────────────────────────────────
+  otaWeb.on("/", HTTP_GET, []() {
+    otaWeb.send_P(200, "text/html", OTA_PAGE);
+  });
+
+  otaWeb.on("/update", HTTP_POST, []() {
+    otaWeb.sendHeader("Connection", "close");
+    otaWeb.send(200, "text/plain", Update.hasError() ? "FAIL" : "OK");
+    delay(500);
+    ESP.restart();
+  }, []() {
+    HTTPUpload& upload = otaWeb.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      otaInProgress = true;
+      Serial.printf("Web OTA: %s\n", upload.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) {
+        Serial.printf("Web OTA OK: %u bytes\n", upload.totalSize);
+      } else {
+        Update.printError(Serial);
+      }
+      otaInProgress = false;
+    }
+  });
+
+  otaWeb.on("/info", HTTP_GET, []() {
+    String json = "{\"version\":\"v3.1\",\"ip\":\"" + WiFi.localIP().toString() +
+                  "\",\"hostname\":\"meetingroom-display\",\"uptime\":" + String(millis()/1000) +
+                  ",\"rssi\":" + String(WiFi.RSSI()) + "}";
+    otaWeb.send(200, "application/json", json);
+  });
+
+  otaWeb.begin();
+  Serial.println("OTA ready: http://" + WiFi.localIP().toString() + " / meetingroom-display.local");
+}
 
 // ── Clock Update ─────────────────────────────────────────────────
 unsigned long lastClockUpdate = 0;
@@ -625,8 +758,11 @@ void setup() {
     delay(50);
   }
 
+  // OTA Setup
+  setupOTA();
+
   drawDisplay();
-  Serial.println("Setup done.");
+  Serial.println("Setup done. OTA active.");
 }
 
 // ── Loop ──────────────────────────────────────────────────────────
@@ -635,6 +771,11 @@ void loop() {
   // In deep sleep mode: fetch, draw, sleep
   enterDeepSleep();
 #endif
+
+  // OTA handlers
+  ArduinoOTA.handle();
+  otaWeb.handleClient();
+  if (otaInProgress) return;  // Don't do anything else during OTA
 
   if (WiFi.status() != WL_CONNECTED) connectWifi();
   if (!mqtt.connected()) connectMqtt();
