@@ -1,8 +1,9 @@
 /**
- * Meetingroom E-Paper Display v2
+ * Meetingroom E-Paper Display v3
  * Hardware: Elecrow CrowPanel 4.2" ESP32-S3, SSD1683, 400x300
  * SPI: Bit-Banging (Hardware SPI funktioniert nicht auf CrowPanel)
  *
+ * v3: Battery display, Deep Sleep, Spontan-Meeting via Buttons
  * Konfiguration: config.h (WiFi, MQTT, HA, Timing, Logo)
  * Logo: helo_logo.h (austauschbar)
  */
@@ -21,6 +22,34 @@
 #endif
 
 typedef unsigned char UBYTE;
+
+// ── Hardware Buttons (active LOW) ─────────────────────────────────
+#define BTN_HOME  2
+#define BTN_EXIT  1
+#define BTN_PREV  6
+#define BTN_NEXT  4
+#define BTN_OK    5
+
+// ── Battery ADC ──────────────────────────────────────────────────
+// BAT connector routes through voltage divider to ADC
+// ESP32-S3 ADC: 0-3.3V → 0-4095
+// Voltage divider: factor ~2 (measure and calibrate!)
+#ifndef BAT_ADC_PIN
+#define BAT_ADC_PIN  9   // GPIO9 — adjust if your board differs
+#endif
+#ifndef BAT_VDIV_FACTOR
+#define BAT_VDIV_FACTOR 2.0f  // Voltage divider ratio
+#endif
+#define BAT_FULL_V  4.2f
+#define BAT_EMPTY_V 3.2f
+
+// ── Deep Sleep ───────────────────────────────────────────────────
+#ifndef SLEEP_BETWEEN_UPDATES
+#define SLEEP_BETWEEN_UPDATES 0   // 0=disabled (always on), 1=deep sleep
+#endif
+#ifndef SLEEP_DURATION_MIN
+#define SLEEP_DURATION_MIN 5      // Minutes between wake-ups
+#endif
 
 // ── Display ───────────────────────────────────────────────────────
 #define EPD_WIDTH  400
@@ -55,6 +84,18 @@ unsigned long lastHttpFetch   = 0;
 unsigned long lastDraw        = 0;
 unsigned long lastFullRefresh = 0;
 
+// ── Forward declarations ─────────────────────────────────────────
+void drawDisplay();
+void drawSpontanMenu();
+
+// ── Spontan-Meeting State ────────────────────────────────────────
+bool    spontanActive   = false;
+time_t  spontanEnd      = 0;
+bool    inSpontanMenu   = false;
+int     spontanChoice   = 0;      // 0=15min, 1=30min, 2=60min, 3=cancel
+const int spontanOptions[] = {15, 30, 60};
+const int numSpontanOpts = 3;
+
 // ── Helpers ───────────────────────────────────────────────────────
 
 // Replace UTF-8 umlauts with ASCII equivalents for EPD font
@@ -69,6 +110,7 @@ String sanitize(const String& s) {
   r.replace("\xC3\x9F", "ss");  // ß
   return r;
 }
+
 String extractTime(const String& dt) {
   int tPos = dt.indexOf('T');
   if (tPos >= 0 && dt.length() >= (unsigned)(tPos + 6))
@@ -83,6 +125,34 @@ String extractDate(const String& dt) {
   if (dt.length() >= 10)
     return dt.substring(8, 10) + "." + dt.substring(5, 7);
   return dt;
+}
+
+// ── Battery ──────────────────────────────────────────────────────
+float readBatteryVoltage() {
+  int raw = analogRead(BAT_ADC_PIN);
+  float v = (raw / 4095.0f) * 3.3f * BAT_VDIV_FACTOR;
+  return v;
+}
+
+int batteryPercent(float voltage) {
+  if (voltage >= BAT_FULL_V) return 100;
+  if (voltage <= BAT_EMPTY_V) return 0;
+  return (int)(((voltage - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V)) * 100.0f);
+}
+
+void drawBatteryIcon(int x, int y, int pct) {
+  // Battery outline: 24x12 px
+  EPD_DrawRectangle(x, y, x + 24, y + 12, BLACK, 0);
+  EPD_DrawRectangle(x + 24, y + 3, x + 27, y + 9, BLACK, 1); // tip
+  // Fill based on percent
+  int fillW = (int)(20.0f * pct / 100.0f);
+  if (fillW > 0) {
+    EPD_DrawRectangle(x + 2, y + 2, x + 2 + fillW, y + 10, BLACK, 1);
+  }
+  // Percent text
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%d%%", pct);
+  EPD_ShowString(x + 30, y, buf, 12, BLACK);
 }
 
 // ── WiFi ──────────────────────────────────────────────────────────
@@ -189,23 +259,159 @@ void connectMqtt() {
   }
 }
 
-
 // ── Meeting Progress ──────────────────────────────────────────────
-// Parst "2026-03-05 22:00:00" oder "2026-03-05T22:00:00+01:00" zu epoch
 time_t parseDateTime(const String& dt) {
   struct tm tm = {};
-  // Format: YYYY-MM-DD HH:MM:SS oder YYYY-MM-DDTHH:MM:SS
   if (dt.length() < 16) return 0;
   tm.tm_year = dt.substring(0, 4).toInt() - 1900;
   tm.tm_mon  = dt.substring(5, 7).toInt() - 1;
   tm.tm_mday = dt.substring(8, 10).toInt();
-  int sep = (dt.charAt(10) == 'T') ? 11 : 11;
   tm.tm_hour = dt.substring(11, 13).toInt();
   tm.tm_min  = dt.substring(14, 16).toInt();
   if (dt.length() >= 19) tm.tm_sec = dt.substring(17, 19).toInt();
   tm.tm_isdst = -1;
   return mktime(&tm);
 }
+
+// ── Spontan-Meeting ──────────────────────────────────────────────
+void drawSpontanMenu() {
+  EPD_Init_Fast(Fast_Seconds_1_5s);
+  Paint_NewImage(BlackImage, EPD_WIDTH, EPD_HEIGHT, ROTATE_0, WHITE);
+  EPD_Full(WHITE);
+
+  EPD_DrawRectangle(0, 0, 399, 49, BLACK, 1);
+  EPD_ShowString(80, 14, "Spontanes Meeting", 24, WHITE);
+
+  int y = 70;
+  EPD_ShowString(30, y, "Dauer waehlen:", 24, BLACK);
+  y += 40;
+
+  for (int i = 0; i < numSpontanOpts; i++) {
+    char label[20];
+    snprintf(label, sizeof(label), "%d Minuten", spontanOptions[i]);
+    if (i == spontanChoice) {
+      EPD_DrawRectangle(20, y - 4, 380, y + 28, BLACK, 1);
+      EPD_ShowString(40, y, label, 24, WHITE);
+    } else {
+      EPD_DrawRectangle(20, y - 4, 380, y + 28, BLACK, 0);
+      EPD_ShowString(40, y, label, 24, BLACK);
+    }
+    y += 40;
+  }
+
+  y += 10;
+  EPD_ShowString(20, y, "[Hoch/Runter] Waehlen", 16, BLACK);
+  EPD_ShowString(20, y + 20, "[OK] Bestaetigen  [Exit] Abbrechen", 16, BLACK);
+
+  EPD_Display_Fast(BlackImage);
+  EPD_Sleep();
+}
+
+void startSpontanMeeting(int minutes) {
+  struct tm tnow;
+  if (!getLocalTime(&tnow)) return;
+
+  time_t now = mktime(&tnow);
+  spontanEnd = now + (minutes * 60);
+  spontanActive = true;
+
+  // Build time strings
+  struct tm tmEnd;
+  localtime_r(&spontanEnd, &tmEnd);
+
+  char startStr[25], endStr[25];
+  strftime(startStr, sizeof(startStr), "%Y-%m-%d %H:%M:%S", &tnow);
+  strftime(endStr, sizeof(endStr), "%Y-%m-%d %H:%M:%S", &tmEnd);
+
+  // Override room state
+  room.occupied = true;
+  room.curTitle = "Spontanes Meeting";
+  room.curStart = String(startStr);
+  room.curEnd   = String(endStr);
+
+  // Publish via MQTT so HA knows
+  mqtt.publish(topicOccupied.c_str(), "true", true);
+  mqtt.publish(topicCurTitle.c_str(), "Spontanes Meeting", true);
+  mqtt.publish(topicCurStart.c_str(), startStr, true);
+  mqtt.publish(topicCurEnd.c_str(), endStr, true);
+
+  Serial.printf("Spontan Meeting: %d min, bis %s\n", minutes, endStr);
+}
+
+void checkSpontanExpiry() {
+  if (!spontanActive) return;
+  struct tm tnow;
+  if (!getLocalTime(&tnow)) return;
+  time_t now = mktime(&tnow);
+  if (now >= spontanEnd) {
+    spontanActive = false;
+    room.occupied = false;
+    room.curTitle = "";
+    room.curStart = "";
+    room.curEnd   = "";
+    mqtt.publish(topicOccupied.c_str(), "false", true);
+    mqtt.publish(topicCurTitle.c_str(), "", true);
+    mqtt.publish(topicCurStart.c_str(), "", true);
+    mqtt.publish(topicCurEnd.c_str(), "", true);
+    room.dirty = true;
+    Serial.println("Spontan Meeting ended");
+  }
+}
+
+// ── Buttons ──────────────────────────────────────────────────────
+void handleButtons() {
+  // Check for HOME button → open/close spontan menu
+  if (digitalRead(BTN_HOME) == LOW) {
+    delay(200);  // debounce
+    if (digitalRead(BTN_HOME) == LOW) {
+      if (!inSpontanMenu && !room.occupied) {
+        inSpontanMenu = true;
+        spontanChoice = 0;
+        drawSpontanMenu();
+      } else if (inSpontanMenu) {
+        inSpontanMenu = false;
+        drawDisplay();
+      }
+      while (digitalRead(BTN_HOME) == LOW) delay(50);  // wait release
+    }
+  }
+
+  if (!inSpontanMenu) return;
+
+  // PREV (Up)
+  if (digitalRead(BTN_PREV) == LOW) {
+    delay(200);
+    if (spontanChoice > 0) spontanChoice--;
+    drawSpontanMenu();
+    while (digitalRead(BTN_PREV) == LOW) delay(50);
+  }
+
+  // NEXT (Down)
+  if (digitalRead(BTN_NEXT) == LOW) {
+    delay(200);
+    if (spontanChoice < numSpontanOpts - 1) spontanChoice++;
+    drawSpontanMenu();
+    while (digitalRead(BTN_NEXT) == LOW) delay(50);
+  }
+
+  // OK → start meeting
+  if (digitalRead(BTN_OK) == LOW) {
+    delay(200);
+    startSpontanMeeting(spontanOptions[spontanChoice]);
+    inSpontanMenu = false;
+    drawDisplay();
+    while (digitalRead(BTN_OK) == LOW) delay(50);
+  }
+
+  // EXIT → cancel
+  if (digitalRead(BTN_EXIT) == LOW) {
+    delay(200);
+    inSpontanMenu = false;
+    drawDisplay();
+    while (digitalRead(BTN_EXIT) == LOW) delay(50);
+  }
+}
+
 
 // ── Draw ──────────────────────────────────────────────────────────
 void drawDisplay() {
@@ -252,12 +458,10 @@ void drawDisplay() {
 
     // ── Fortschrittsbalken ──────────────────────────────────────
     int barX = 12;
-    int barW = 376;  // 12 bis 388
+    int barW = 376;
     int barH = 14;
-    // Rahmen
     EPD_DrawRectangle(barX, y, barX + barW, y + barH, BLACK, 0);
 
-    // Fortschritt berechnen
     time_t tStart = parseDateTime(room.curStart);
     time_t tEnd   = parseDateTime(room.curEnd);
     struct tm tnow;
@@ -270,10 +474,8 @@ void drawDisplay() {
       if (fillW > 0) {
         EPD_DrawRectangle(barX + 2, y + 2, barX + 2 + fillW, y + barH - 2, BLACK, 1);
       }
-      // Prozent rechts neben dem Balken
       char pctBuf[6];
       snprintf(pctBuf, sizeof(pctBuf), "%d%%", (int)(progress * 100));
-      // Verbleibende Minuten links anzeigen
       int remaining = (int)((tEnd - tNow) / 60);
       if (remaining > 0) {
         char remBuf[20];
@@ -290,12 +492,12 @@ void drawDisplay() {
     y += 70;
   }
 
-  // ── Trennlinie (nur bei FREI oder nach Balken) ────────────────
+  // ── Trennlinie ────────────────────────────────────────────────
   y += 4;
   EPD_DrawLine(10, y, 389, y, BLACK);
   y += 10;
 
-  // ── Nächstes Meeting ──────────────────────────────────────────
+  // ── Naechstes Meeting ─────────────────────────────────────────
   EPD_ShowString(12, y, "Naechstes Meeting", 16, BLACK);
   EPD_DrawLine(12, y + 18, 180, y + 18, BLACK);
   y += 26;
@@ -323,7 +525,18 @@ void drawDisplay() {
     strftime(sbuf, sizeof(sbuf), "Aktualisiert: %H:%M", &tf);
     EPD_ShowString(8, 287, sbuf, 12, BLACK);
   }
+
+  // Battery icon in footer
+  float batV = readBatteryVoltage();
+  int batPct = batteryPercent(batV);
+  drawBatteryIcon(220, 287, batPct);
+
   EPD_ShowString(300, 287, COMPANY_NAME, 12, BLACK);
+
+  // ── Hint: Home button for spontan meeting ─────────────────────
+  if (!room.occupied) {
+    EPD_ShowString(110, 268, "[Home] Spontanes Meeting", 12, BLACK);
+  }
 
   // ── Refresh ───────────────────────────────────────────────────
   EPD_Display_Fast(BlackImage);
@@ -337,6 +550,20 @@ void drawDisplay() {
 }
 
 
+// ── Deep Sleep ───────────────────────────────────────────────────
+#if SLEEP_BETWEEN_UPDATES
+void enterDeepSleep() {
+  Serial.printf("Deep sleep for %d min...\n", SLEEP_DURATION_MIN);
+  // Wake on HOME button (GPIO2) or timer
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN_HOME, 0);  // LOW = pressed
+  esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_DURATION_MIN * 60ULL * 1000000ULL);
+  // Power off display
+  digitalWrite(7, LOW);
+  WiFi.disconnect(true);
+  esp_deep_sleep_start();
+}
+#endif
+
 // ── Clock Update ─────────────────────────────────────────────────
 unsigned long lastClockUpdate = 0;
 char lastTimeStr[6] = "";
@@ -345,7 +572,7 @@ char lastTimeStr[6] = "";
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== Meetingroom Display v2 ===");
+  Serial.println("\n=== Meetingroom Display v3 ===");
 
   // MQTT Topics aus Prefix bauen
   String prefix = String(MQTT_PREFIX);
@@ -359,6 +586,17 @@ void setup() {
   // Display Power
   pinMode(7, OUTPUT);
   digitalWrite(7, HIGH);
+
+  // Buttons (active LOW with internal pullup)
+  pinMode(BTN_HOME, INPUT_PULLUP);
+  pinMode(BTN_EXIT, INPUT_PULLUP);
+  pinMode(BTN_PREV, INPUT_PULLUP);
+  pinMode(BTN_NEXT, INPUT_PULLUP);
+  pinMode(BTN_OK,   INPUT_PULLUP);
+
+  // Battery ADC
+  analogReadResolution(12);
+  pinMode(BAT_ADC_PIN, INPUT);
 
   // EPD Init + Splash
   EPD_GPIOInit();
@@ -393,11 +631,22 @@ void setup() {
 
 // ── Loop ──────────────────────────────────────────────────────────
 void loop() {
+#if SLEEP_BETWEEN_UPDATES
+  // In deep sleep mode: fetch, draw, sleep
+  enterDeepSleep();
+#endif
+
   if (WiFi.status() != WL_CONNECTED) connectWifi();
   if (!mqtt.connected()) connectMqtt();
   mqtt.loop();
 
   unsigned long now = millis();
+
+  // Button handling
+  handleButtons();
+
+  // Check spontan meeting expiry
+  checkSpontanExpiry();
 
   // Settling
   if (room.dirtyAt > 0 && (now - room.dirtyAt > MQTT_SETTLE_MS)) {
@@ -421,7 +670,7 @@ void loop() {
     drawDisplay();
   }
 
-  // Uhrzeit jede Minute aktualisieren (Full Fast Refresh)
+  // Uhrzeit jede Minute aktualisieren
   if (now - lastClockUpdate > 60000UL) {
     struct tm tc;
     if (getLocalTime(&tc)) {
@@ -436,5 +685,5 @@ void loop() {
     lastClockUpdate = now;
   }
 
-  delay(200);
+  delay(100);  // 100ms statt 200ms für bessere Button-Reaktion
 }

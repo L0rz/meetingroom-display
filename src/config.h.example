@@ -3,47 +3,69 @@
 
 // ══════════════════════════════════════════════════════════════════
 //  Meetingroom E-Paper Display — Konfiguration
-//  Kopiere diese Datei nach config.h und passe die Werte an.
+//  Alle einstellbaren Parameter an einer Stelle.
 // ══════════════════════════════════════════════════════════════════
 
 // ── WiFi ─────────────────────────────────────────────────────────
-#define WIFI_SSID          "MeinWLAN"
-#define WIFI_PASSWORD      "MeinPasswort"
+#define WIFI_SSID          "DeepSpaceNetwork-iot"
+#define WIFI_PASSWORD      "microbots"
 
 // ── MQTT Broker ──────────────────────────────────────────────────
-#define MQTT_HOST          "192.168.1.100"
+#define MQTT_HOST          "192.168.130.3"
 #define MQTT_PORT          1883
 #define MQTT_USER          "mqtt"
-#define MQTT_PASS          "geheim"
+#define MQTT_PASS          "cw&LR8d8"
 #define MQTT_CLIENT_ID     "meetingroom-display"
 
 // MQTT Topics (Prefix ändern für mehrere Räume)
 #define MQTT_PREFIX        "meetingroom"
+// Daraus werden: meetingroom/occupied, meetingroom/current/title, etc.
 
 // ── Home Assistant ───────────────────────────────────────────────
-#define HA_HOST            "192.168.1.100"
+#define HA_HOST            "192.168.130.3"
 #define HA_PORT            8123
-#define HA_TOKEN           "dein-long-lived-access-token"
+#define HA_TOKEN           "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIzMTc2NGM5ODhkNjE0MDdmODAzMjVhNmVlMTM0ZDY4YiIsImlhdCI6MTc3MjQ2NTkwMCwiZXhwIjoyMDg3ODI1OTAwfQ.qiD_fzX867luKzvReK6quV5BYK4-rvmnw_B8SVNeEHw"
 
-// Kalender-Entity in HA
-#define HA_CALENDAR_ENTITY "calendar.meetingraum"
+// Kalender-Entity in HA (z.B. calendar.meetingraum oder calendar.test2)
+#define HA_CALENDAR_ENTITY "calendar.test2"
 
-// Input-Text Entities für nächstes Meeting
+// Input-Text Entities für nächstes Meeting (von HA Automation befüllt)
 #define HA_NEXT_TITLE      "input_text.meetingraum_next_title"
 #define HA_NEXT_START      "input_text.meetingraum_next_start"
 
 // ── Display ──────────────────────────────────────────────────────
+// Raumname im Header
 #define ROOM_NAME          "Meetingraum"
-#define COMPANY_NAME       "Firma GmbH"
 
-// Logo (1 = anzeigen, 0 = nur Raumname als Text)
+// Firmenname im Footer
+#define COMPANY_NAME       "HELO Systems"
+
+// Logo: helo_logo.h einbinden (oder eigenes Logo als C-Array)
+// Zum Deaktivieren: SHOW_LOGO auf 0 setzen
 #define SHOW_LOGO          1
 
 // ── Timing ───────────────────────────────────────────────────────
-#define HTTP_INTERVAL_MS   (3UL * 60UL * 1000UL)     // 3 Min
-#define MIN_DRAW_MS        (3UL * 60UL * 1000UL)     // 3 Min
-#define MQTT_SETTLE_MS     (10UL * 1000UL)            // 10 Sek
-#define FULL_REFRESH_MS    (60UL * 60UL * 1000UL)     // 60 Min
+// HTTP Fallback Intervall (ms) — wie oft HA gepollt wird
+#define HTTP_INTERVAL_MS   (3UL * 60UL * 1000UL)     // 3 Minuten
+
+// Minimale Zeit zwischen Display-Updates (ms)
+#define MIN_DRAW_MS        (3UL * 60UL * 1000UL)     // 3 Minuten
+
+// Settle-Zeit nach MQTT-Änderung bevor gezeichnet wird (ms)
+#define MQTT_SETTLE_MS     (10UL * 1000UL)            // 10 Sekunden
+
+// Anti-Ghosting Full-Refresh Intervall (ms)
+#define FULL_REFRESH_MS    (60UL * 60UL * 1000UL)     // 60 Minuten
+
+// ── Battery ──────────────────────────────────────────────────────
+// ADC Pin für Batteriespannung (über Voltage Divider)
+#define BAT_ADC_PIN        9    // GPIO9 — ggf. anpassen
+#define BAT_VDIV_FACTOR    2.0f // Spannungsteiler-Faktor (kalibrieren!)
+
+// ── Deep Sleep (Batterie-Optimierung) ────────────────────────────
+// 0 = immer an (Strombetrieb), 1 = Deep Sleep zwischen Updates
+#define SLEEP_BETWEEN_UPDATES 0
+#define SLEEP_DURATION_MIN    5  // Minuten zwischen Wake-ups
 
 // ── Timezone ─────────────────────────────────────────────────────
 #define NTP_SERVER         "pool.ntp.org"
