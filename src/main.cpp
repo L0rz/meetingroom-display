@@ -56,6 +56,19 @@ unsigned long lastDraw        = 0;
 unsigned long lastFullRefresh = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────
+
+// Replace UTF-8 umlauts with ASCII equivalents for EPD font
+String sanitize(const String& s) {
+  String r = s;
+  r.replace("\xC3\xA4", "ae");  // ä
+  r.replace("\xC3\xB6", "oe");  // ö
+  r.replace("\xC3\xBC", "ue");  // ü
+  r.replace("\xC3\x84", "Ae");  // Ä
+  r.replace("\xC3\x96", "Oe");  // Ö
+  r.replace("\xC3\x9C", "Ue");  // Ü
+  r.replace("\xC3\x9F", "ss");  // ß
+  return r;
+}
 String extractTime(const String& dt) {
   int tPos = dt.indexOf('T');
   if (tPos >= 0 && dt.length() >= (unsigned)(tPos + 6))
@@ -228,12 +241,12 @@ void drawDisplay() {
 
     String title = room.curTitle;
     if (title.length() > 34) title = title.substring(0, 31) + "...";
-    EPD_ShowString(12, y, title.c_str(), 24, BLACK);
+    EPD_ShowString(12, y, sanitize(title).c_str(), 24, BLACK);
     y += 28;
 
     if (room.curStart.length() > 0) {
       String zeitraum = extractTime(room.curStart) + " - " + extractTime(room.curEnd) + " Uhr";
-      EPD_ShowString(12, y, zeitraum.c_str(), 16, BLACK);
+      EPD_ShowString(12, y, sanitize(zeitraum).c_str(), 16, BLACK);
       y += 24;
     }
 
@@ -292,11 +305,11 @@ void drawDisplay() {
       room.nextTitle != "Keine Termine") {
     String nt = room.nextTitle;
     if (nt.length() > 34) nt = nt.substring(0, 31) + "...";
-    EPD_ShowString(12, y, nt.c_str(), 16, BLACK);
+    EPD_ShowString(12, y, sanitize(nt).c_str(), 16, BLACK);
     y += 22;
     if (room.nextStart.length() >= 16) {
       String info = extractTime(room.nextStart) + " Uhr  |  " + extractDate(room.nextStart);
-      EPD_ShowString(12, y, info.c_str(), 16, BLACK);
+      EPD_ShowString(12, y, sanitize(info).c_str(), 16, BLACK);
     }
   } else {
     EPD_ShowString(12, y, "Keine weiteren Termine", 16, BLACK);
