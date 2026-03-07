@@ -2,8 +2,14 @@
 #define CONFIG_H
 
 // ══════════════════════════════════════════════════════════════════
-//  Meetingroom E-Paper Display — Konfiguration
-//  Alle einstellbaren Parameter an einer Stelle.
+//  Meetingroom E-Paper Display — Konfiguration (Defaults)
+//
+//  Diese Werte werden als Fallback genutzt wenn NVS leer ist.
+//  Nach dem ersten Boot kann alles über das Web-Portal
+//  konfiguriert werden: http://<IP>/config
+//
+//  Bei neuem Display ohne WiFi-Config startet automatisch
+//  ein Hotspot "Meetingroom-Setup" mit Captive Portal.
 // ══════════════════════════════════════════════════════════════════
 
 // ── WiFi ─────────────────────────────────────────────────────────
@@ -24,7 +30,7 @@
 // ── Home Assistant ───────────────────────────────────────────────
 #define HA_HOST            "192.168.130.3"
 #define HA_PORT            8123
-#define HA_TOKEN           "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiIzMTc2NGM5ODhkNjE0MDdmODAzMjVhNmVlMTM0ZDY4YiIsImlhdCI6MTc3MjQ2NTkwMCwiZXhwIjoyMDg3ODI1OTAwfQ.qiD_fzX867luKzvReK6quV5BYK4-rvmnw_B8SVNeEHw"
+#define HA_TOKEN           "your-long-lived-access-token"
 
 // Kalender-Entity in HA (z.B. calendar.meetingraum oder calendar.test2)
 #define HA_CALENDAR_ENTITY "calendar.test2"

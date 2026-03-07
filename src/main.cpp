@@ -1,11 +1,12 @@
 /**
- * Meetingroom E-Paper Display v3.1
+ * Meetingroom E-Paper Display v4.0
  * Hardware: Elecrow CrowPanel 4.2" ESP32-S3, SSD1683, 400x300
  * SPI: Bit-Banging (Hardware SPI funktioniert nicht auf CrowPanel)
  *
+ * v4.0: Web-Config Portal + WiFi AP Fallback (Captive Portal) + NVS Storage
  * v3.1: OTA Updates (ArduinoOTA + Web Upload)
  * v3:   Battery display, Deep Sleep, Spontan-Meeting via Buttons
- * Konfiguration: config.h (WiFi, MQTT, HA, Timing, Logo)
+ * Konfiguration: NVS (persistent) → config.h (Defaults/Fallback)
  * Logo: helo_logo.h (austauschbar)
  */
 
@@ -21,6 +22,7 @@
 #include "EPD.h"
 #include "EPD_GUI.h"
 #include "config.h"
+#include "config_portal.h"
 #if SHOW_LOGO
 #include "helo_logo.h"
 #endif
@@ -160,25 +162,17 @@ void drawBatteryIcon(int x, int y, int pct) {
   EPD_ShowString(x + 30, y, buf, 12, BLACK);
 }
 
-// ── WiFi ──────────────────────────────────────────────────────────
+// ── WiFi (now uses config_portal) ─────────────────────────────────
 void connectWifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("WiFi...");
-  int tries = 0;
-  while (WiFi.status() != WL_CONNECTED && tries < 40) {
-    delay(500); Serial.print("."); tries++;
-  }
-  Serial.println(WiFi.status() == WL_CONNECTED
-    ? " OK: " + WiFi.localIP().toString() : " FAIL");
+  configStartWiFi(15000);
 }
 
 // ── HTTP ──────────────────────────────────────────────────────────
 String haGet(const String& path) {
-  if (WiFi.status() != WL_CONNECTED) return "";
+  if (WiFi.status() != WL_CONNECTED || apMode) return "";
   HTTPClient http;
-  http.begin("http://" + String(HA_HOST) + ":" + String(HA_PORT) + path);
-  http.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
+  http.begin("http://" + cfg.haHost + ":" + String(cfg.haPort) + path);
+  http.addHeader("Authorization", String("Bearer ") + cfg.haToken);
   int code = http.GET();
   String body = (code == 200) ? http.getString() : "";
   http.end();
@@ -189,7 +183,7 @@ void fetchFromHA() {
   Serial.println("Fetching HA...");
   bool changed = false;
 
-  String body = haGet("/api/states/" + String(HA_CALENDAR_ENTITY));
+  String body = haGet("/api/states/" + cfg.haCalendarEntity);
   if (body.length() > 0) {
     JsonDocument doc;
     if (deserializeJson(doc, body) == DeserializationError::Ok) {
@@ -207,7 +201,7 @@ void fetchFromHA() {
     }
   }
 
-  body = haGet("/api/states/" + String(HA_NEXT_TITLE));
+  body = haGet("/api/states/" + cfg.haNextTitle);
   if (body.length() > 0) {
     JsonDocument doc;
     if (deserializeJson(doc, body) == DeserializationError::Ok) {
@@ -216,7 +210,7 @@ void fetchFromHA() {
     }
   }
 
-  body = haGet("/api/states/" + String(HA_NEXT_START));
+  body = haGet("/api/states/" + cfg.haNextStart);
   if (body.length() > 0) {
     JsonDocument doc;
     if (deserializeJson(doc, body) == DeserializationError::Ok) {
@@ -247,11 +241,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
 }
 
 void connectMqtt() {
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  if (apMode) return;  // No MQTT in AP mode
+  mqtt.setServer(cfg.mqttHost.c_str(), cfg.mqttPort);
   mqtt.setCallback(mqttCallback);
   mqtt.setBufferSize(512);
   Serial.print("MQTT...");
-  if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+  if (mqtt.connect(cfg.mqttClientId.c_str(), cfg.mqttUser.c_str(), cfg.mqttPass.c_str())) {
     Serial.println(" OK");
     mqtt.subscribe(topicOccupied.c_str());
     mqtt.subscribe(topicCurTitle.c_str());
@@ -431,7 +426,7 @@ void drawDisplay() {
 #if SHOW_LOGO
   EPD_ShowPicture(8, 7, LOGO_W, LOGO_H, helo_logo, WHITE);
 #else
-  EPD_ShowString(10, 12, ROOM_NAME, 24, WHITE);
+  EPD_ShowString(10, 12, cfg.roomName.c_str(), 24, WHITE);
 #endif
 
   struct tm ti;
@@ -540,7 +535,7 @@ void drawDisplay() {
   String ip = WiFi.localIP().toString();
   EPD_ShowString(180, 287, ip.c_str(), 12, BLACK);
 
-  EPD_ShowString(300, 287, COMPANY_NAME, 12, BLACK);
+  EPD_ShowString(300, 287, cfg.companyName.c_str(), 12, BLACK);
 
   // ── Hint: Home button for spontan meeting ─────────────────────
   if (!room.occupied) {
@@ -601,7 +596,7 @@ button:hover{background:#00a8cc}
 </div>
 <div class="box info">
 <p><strong>Hostname:</strong> meetingroom-display.local</p>
-<p><strong>Version:</strong> v3.1</p>
+<p><strong>Version:</strong> v4.0</p>
 <p><strong>IP:</strong> <span id="ip">-</span></p>
 </div>
 <script>
@@ -629,7 +624,7 @@ bool otaInProgress = false;
 void setupOTA() {
   // ── ArduinoOTA (PlatformIO / espota) ──────────────────────────
   ArduinoOTA.setHostname("meetingroom-display");
-  ArduinoOTA.setPassword(WIFI_PASSWORD);  // Use WiFi password for OTA auth
+  ArduinoOTA.setPassword(cfg.wifiPass.c_str());  // Use WiFi password for OTA auth
   ArduinoOTA.onStart([]() {
     otaInProgress = true;
     Serial.println("OTA Start...");
@@ -687,7 +682,7 @@ void setupOTA() {
   });
 
   otaWeb.on("/info", HTTP_GET, []() {
-    String json = "{\"version\":\"v3.1\",\"ip\":\"" + WiFi.localIP().toString() +
+    String json = "{\"version\":\"v4.0\",\"ip\":\"" + WiFi.localIP().toString() +
                   "\",\"hostname\":\"meetingroom-display\",\"uptime\":" + String(millis()/1000) +
                   ",\"rssi\":" + String(WiFi.RSSI()) + "}";
     otaWeb.send(200, "application/json", json);
@@ -705,16 +700,18 @@ char lastTimeStr[6] = "";
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== Meetingroom Display v3 ===");
+  Serial.println("\n=== Meetingroom Display v4.0 ===");
+
+  // 1. Load config from NVS (or config.h defaults)
+  configLoadFromNVS();
 
   // MQTT Topics aus Prefix bauen
-  String prefix = String(MQTT_PREFIX);
-  topicOccupied  = prefix + "/occupied";
-  topicCurTitle  = prefix + "/current/title";
-  topicCurStart  = prefix + "/current/start";
-  topicCurEnd    = prefix + "/current/end";
-  topicNextTitle = prefix + "/next/title";
-  topicNextStart = prefix + "/next/start";
+  topicOccupied  = cfg.mqttPrefix + "/occupied";
+  topicCurTitle  = cfg.mqttPrefix + "/current/title";
+  topicCurStart  = cfg.mqttPrefix + "/current/start";
+  topicCurEnd    = cfg.mqttPrefix + "/current/end";
+  topicNextTitle = cfg.mqttPrefix + "/next/title";
+  topicNextStart = cfg.mqttPrefix + "/next/start";
 
   // Display Power
   pinMode(7, OUTPUT);
@@ -740,29 +737,56 @@ void setup() {
   EPD_Display_Part(0, 0, EPD_WIDTH, EPD_HEIGHT, BlackImage);
   EPD_Sleep();
 
-  // WiFi + NTP
-  connectWifi();
-  configTime(0, 0, NTP_SERVER);
-  setenv("TZ", TIMEZONE, 1);
-  tzset();
-  delay(1500);
+  // 2. WiFi: STA first, AP fallback
+  if (!configStartWiFi(15000)) {
+    // WiFi failed → AP mode with captive portal
+    configStartAP();
 
-  // Daten + MQTT
-  fetchFromHA();
-  connectMqtt();
-
-  // Warten auf MQTT retained Messages
-  unsigned long t = millis();
-  while (millis() - t < 3000) {
-    mqtt.loop();
-    delay(50);
+    // Show AP info on display
+    EPD_Init_Fast(Fast_Seconds_1_5s);
+    Paint_NewImage(BlackImage, EPD_WIDTH, EPD_HEIGHT, ROTATE_0, WHITE);
+    EPD_Full(WHITE);
+    EPD_DrawRectangle(0, 0, 399, 49, BLACK, 1);
+    EPD_ShowString(100, 14, "WiFi Setup", 24, WHITE);
+    EPD_ShowString(20, 70, "Kein WiFi gefunden!", 24, BLACK);
+    EPD_ShowString(20, 110, "Verbinde dich mit:", 16, BLACK);
+    EPD_ShowString(20, 135, "SSID: Meetingroom-Setup", 24, BLACK);
+    EPD_ShowString(20, 175, "Dann oeffne:", 16, BLACK);
+    String url = "http://" + WiFi.softAPIP().toString() + "/config";
+    EPD_ShowString(20, 200, url.c_str(), 16, BLACK);
+    EPD_ShowString(20, 240, "oder warte auf Captive Portal", 12, BLACK);
+    EPD_Display_Fast(BlackImage);
+    EPD_Sleep();
   }
 
-  // OTA Setup
-  setupOTA();
+  // 3. WebServer: Config routes + OTA (works in both modes)
+  configSetupRoutes(otaWeb);
 
-  drawDisplay();
-  Serial.println("Setup done. OTA active.");
+  if (!apMode) {
+    // Normal mode: NTP + HA + MQTT + OTA
+    configTime(0, 0, cfg.ntpServer.c_str());
+    setenv("TZ", cfg.timezone.c_str(), 1);
+    tzset();
+    delay(1500);
+
+    fetchFromHA();
+    connectMqtt();
+
+    // Warten auf MQTT retained Messages
+    unsigned long t = millis();
+    while (millis() - t < 3000) {
+      mqtt.loop();
+      delay(50);
+    }
+
+    setupOTA();
+    drawDisplay();
+    Serial.println("Setup done. Normal mode.");
+  } else {
+    // AP mode: only start web server (OTA setup needs WiFi STA)
+    otaWeb.begin();
+    Serial.println("Setup done. AP config mode.");
+  }
 }
 
 // ── Loop ──────────────────────────────────────────────────────────
@@ -772,9 +796,20 @@ void loop() {
   enterDeepSleep();
 #endif
 
+  // DNS for captive portal
+  configLoopDNS();
+
+  // Web server (always active — config portal + OTA)
+  otaWeb.handleClient();
+
+  // AP mode: only serve config portal
+  if (apMode) {
+    delay(10);
+    return;
+  }
+
   // OTA handlers
   ArduinoOTA.handle();
-  otaWeb.handleClient();
   if (otaInProgress) return;  // Don't do anything else during OTA
 
   if (WiFi.status() != WL_CONNECTED) connectWifi();
@@ -790,24 +825,24 @@ void loop() {
   checkSpontanExpiry();
 
   // Settling
-  if (room.dirtyAt > 0 && (now - room.dirtyAt > MQTT_SETTLE_MS)) {
+  if (room.dirtyAt > 0 && (now - room.dirtyAt > cfg.mqttSettleMs)) {
     room.dirty   = true;
     room.dirtyAt = 0;
   }
 
   // HTTP Polling
-  if (now - lastHttpFetch > HTTP_INTERVAL_MS) {
+  if (now - lastHttpFetch > cfg.httpIntervalMs) {
     fetchFromHA();
     lastHttpFetch = now;
   }
 
   // Anti-Ghosting
-  if (now - lastFullRefresh > FULL_REFRESH_MS) {
+  if (now - lastFullRefresh > cfg.fullRefreshMs) {
     room.dirty = true;
   }
 
   // Draw
-  if (room.dirty && (now - lastDraw > MIN_DRAW_MS)) {
+  if (room.dirty && (now - lastDraw > cfg.minDrawMs)) {
     drawDisplay();
   }
 
