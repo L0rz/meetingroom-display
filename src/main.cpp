@@ -36,19 +36,6 @@ typedef unsigned char UBYTE;
 #define BTN_NEXT  4
 #define BTN_OK    5
 
-// ── Battery ADC ──────────────────────────────────────────────────
-// BAT connector routes through voltage divider to ADC
-// ESP32-S3 ADC: 0-3.3V → 0-4095
-// Voltage divider: factor ~2 (measure and calibrate!)
-#ifndef BAT_ADC_PIN
-#define BAT_ADC_PIN  9   // GPIO9 — adjust if your board differs
-#endif
-#ifndef BAT_VDIV_FACTOR
-#define BAT_VDIV_FACTOR 2.0f  // Voltage divider ratio
-#endif
-#define BAT_FULL_V  4.2f
-#define BAT_EMPTY_V 3.2f
-
 // ── Deep Sleep ───────────────────────────────────────────────────
 #ifndef SLEEP_BETWEEN_UPDATES
 #define SLEEP_BETWEEN_UPDATES 0   // 0=disabled (always on), 1=deep sleep
@@ -132,34 +119,6 @@ String extractDate(const String& dt) {
   if (dt.length() >= 10)
     return dt.substring(8, 10) + "." + dt.substring(5, 7);
   return dt;
-}
-
-// ── Battery ──────────────────────────────────────────────────────
-float readBatteryVoltage() {
-  int raw = analogRead(BAT_ADC_PIN);
-  float v = (raw / 4095.0f) * 3.3f * BAT_VDIV_FACTOR;
-  return v;
-}
-
-int batteryPercent(float voltage) {
-  if (voltage >= BAT_FULL_V) return 100;
-  if (voltage <= BAT_EMPTY_V) return 0;
-  return (int)(((voltage - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V)) * 100.0f);
-}
-
-void drawBatteryIcon(int x, int y, int pct) {
-  // Battery outline: 24x12 px
-  EPD_DrawRectangle(x, y, x + 24, y + 12, BLACK, 0);
-  EPD_DrawRectangle(x + 24, y + 3, x + 27, y + 9, BLACK, 1); // tip
-  // Fill based on percent
-  int fillW = (int)(20.0f * pct / 100.0f);
-  if (fillW > 0) {
-    EPD_DrawRectangle(x + 2, y + 2, x + 2 + fillW, y + 10, BLACK, 1);
-  }
-  // Percent text
-  char buf[6];
-  snprintf(buf, sizeof(buf), "%d%%", pct);
-  EPD_ShowString(x + 30, y, buf, 12, BLACK);
 }
 
 // ── WiFi (now uses config_portal) ─────────────────────────────────
@@ -526,11 +485,6 @@ void drawDisplay() {
     EPD_ShowString(8, 287, sbuf, 12, BLACK);
   }
 
-  // Battery icon in footer (before IP)
-  float batV = readBatteryVoltage();
-  int batPct = batteryPercent(batV);
-  drawBatteryIcon(140, 287, batPct);
-
   // IP address for OTA access
   String ip = WiFi.localIP().toString();
   EPD_ShowString(180, 287, ip.c_str(), 12, BLACK);
@@ -723,10 +677,6 @@ void setup() {
   pinMode(BTN_PREV, INPUT_PULLUP);
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_OK,   INPUT_PULLUP);
-
-  // Battery ADC
-  analogReadResolution(12);
-  pinMode(BAT_ADC_PIN, INPUT);
 
   // EPD Init + Splash
   EPD_GPIOInit();

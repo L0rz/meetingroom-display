@@ -200,14 +200,14 @@ static void handleConfigPage(WebServer& server) {
   html += F("<div class='status'>");
   if (apMode) {
     html += F("<b>Modus:</b> <span class='warn'>AP Setup</span><br>");
-    html += F("<b>AP IP:</b> ") + WiFi.softAPIP().toString() + "<br>";
+    html += String(F("<b>AP IP:</b> ")) + WiFi.softAPIP().toString() + "<br>";
   } else {
     html += F("<b>Modus:</b> <span class='ok'>WiFi verbunden</span><br>");
-    html += F("<b>IP:</b> ") + WiFi.localIP().toString() + "<br>";
-    html += F("<b>RSSI:</b> ") + String(WiFi.RSSI()) + " dBm<br>";
+    html += String(F("<b>IP:</b> ")) + WiFi.localIP().toString() + "<br>";
+    html += String(F("<b>RSSI:</b> ")) + String(WiFi.RSSI()) + " dBm<br>";
   }
-  html += F("<b>Uptime:</b> ") + String(millis() / 60000) + " min<br>";
-  html += F("<b>Free Heap:</b> ") + String(ESP.getFreeHeap() / 1024) + " KB<br>";
+  html += String(F("<b>Uptime:</b> ")) + String(millis() / 60000) + " min<br>";
+  html += String(F("<b>Free Heap:</b> ")) + String(ESP.getFreeHeap() / 1024) + " KB<br>";
   html += F("<b>Firmware:</b> v4.0");
   html += F("</div>");
 
